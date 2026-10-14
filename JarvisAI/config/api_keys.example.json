@@ -1,0 +1,33 @@
+{
+    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+    "os_system": "windows",
+    "ai_provider": "gemini",
+    "hud_style": "core",
+    "push_to_talk_enabled": false,
+    "wake_word_enabled": true,
+    "input_device": "",
+    "output_device": "",
+    "startup_video_enabled": false,
+    "morning_brief_enabled": false,
+    "memory_provider_access": true,
+    "neural_render_scale": 1.0,
+    "voice_name": "Charon",
+    "assistant_name": "JARVIS",
+    "user_name": "",
+    "ui_color": "#0057ff",
+    "plugin_config": {
+        "google_account": {},
+        "instagram_account": {
+            "instagram_user_id": "",
+            "access_token": "",
+            "api_version": ""
+        }
+    },
+    "plugins_enabled": {
+        "calendar_google": false,
+        "email_gmail": false
+    },
+    "clap_wake_enabled": true,
+    "voice_id_enabled": false,
+    "camera_index": 0
+}

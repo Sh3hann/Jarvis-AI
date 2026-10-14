@@ -1,0 +1,990 @@
+"""
+dashboard/server.py — JARVIS Local HTTP Dashboard
+
+Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
+Security at the application layer: AES-256-CBC with session-key-derived key.
+CryptoJS is auto-downloaded once and served locally — no CDN needed after that.
+
+Install deps:  pip install fastapi "uvicorn[standard]" cryptography
+"""
+
+import asyncio
+import base64
+import hashlib
+import os
+import re
+import secrets
+import socket
+import string
+import time
+from pathlib import Path
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
+
+_DEPS_OK = False
+try:
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
+    import uvicorn
+    _DEPS_OK = True
+except ImportError:
+    pass
+
+# python-multipart is required for file uploads — optional dependency
+_UPLOAD_OK = False
+try:
+    from fastapi import UploadFile, File as FastAPIFile
+    _UPLOAD_OK = True
+except Exception:
+    pass
+
+BASE_DIR    = Path(__file__).resolve().parent.parent
+STATIC_DIR  = Path(__file__).parent / "static"
+PORT        = 8000
+MAX_UPLOAD_MB = 500
+
+
+def _twilio_stream_request_url(base_url: str, token: str) -> str:
+    """Build the pinned public WSS URL covered by Twilio's signature."""
+    parsed = urlsplit(base_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       "token=" + quote(token, safe=""), ""))
+
+
+def _make_uploads_dir() -> Path:
+    """Return (and create) the cross-platform uploads folder."""
+    for candidate in [
+        Path.home() / "Downloads" / "JARVIS Uploads",
+        Path.home() / "Documents" / "JARVIS Uploads",
+        BASE_DIR / "uploads",
+    ]:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            pass
+    return BASE_DIR / "uploads"
+
+
+UPLOADS_DIR = _make_uploads_dir()
+
+def _get_gemini_key() -> str | None:
+    try:
+        import json as _json
+        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+            return _json.load(f).get("gemini_api_key")
+    except Exception:
+        return None
+
+_KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
+              if c not in ('O', 'I', 'L', '0', '1')]
+
+# ── AES-256-CBC ───────────────────────────────────────────────────────────────
+_AES_SALT = b'JARVIS-DASHBOARD-v1'
+
+
+def _derive_key(session_key: str) -> bytes:
+    """SHA-256(sessionKey‖salt) → 32-byte AES-256 key (microseconds, no PBKDF2 needed)."""
+    return hashlib.sha256(session_key.encode('utf-8') + _AES_SALT).digest()
+
+
+def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
+    """Decrypt base64(IV[16] ‖ ciphertext) with AES-256-CBC + PKCS7."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding as sym_pad
+    raw      = base64.b64decode(enc_b64)
+    iv, ct   = raw[:16], raw[16:]
+    dec      = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    padded   = dec.update(ct) + dec.finalize()
+    unpadder = sym_pad.PKCS7(128).unpadder()
+    return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
+
+
+# ── CryptoJS (auto-download once, served locally) ─────────────────────────────
+_CRYPTOJS_CDN  = ("https://cdnjs.cloudflare.com/ajax/libs/"
+                  "crypto-js/4.2.0/crypto-js.min.js")
+_CRYPTOJS_FILE = STATIC_DIR / "crypto-js.min.js"
+
+
+def _ensure_network_access(port: int) -> None:
+    """Intentionally a no-op.
+
+    JARVIS must not silently open inbound ports or change a firewall profile.
+    Use a private VPN reverse proxy (for example Tailscale Serve) for remote
+    access. The old firewall-editing code was removed rather than left behind an
+    early return, so it cannot be re-enabled by accident.
+    """
+    return
+
+
+def _ensure_crypto_js() -> None:
+    if _CRYPTOJS_FILE.exists():
+        return
+    try:
+        import urllib.request
+        print("[Dashboard] Downloading CryptoJS (one-time setup)…")
+        urllib.request.urlretrieve(_CRYPTOJS_CDN, str(_CRYPTOJS_FILE))
+        print("[Dashboard] CryptoJS cached — will serve locally from now on.")
+    except Exception as e:
+        print(f"[Dashboard] CryptoJS download failed: {e}")
+        print(f"[Dashboard] Encryption will fall back to CDN load on client.")
+
+
+_ensure_crypto_js()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _local_ip() -> str:
+    """Return the best LAN-facing IPv4 address, no internet required."""
+    # Method 1: route trick (fast, works when internet is available)
+    for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect((probe, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+
+    # Method 2: hostname resolution (works offline on most systems)
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    # Method 3: enumerate all interfaces (fully offline, no external deps)
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+
+def _ensure_certs() -> bool:
+    """
+    Make sure config/certs holds a TLS key pair, generating a self-signed one the
+    first time the dashboard runs.
+
+    A pair is generated locally for each install. If the supplied archive's
+    known shared certificate is found, it is removed before a fresh pair is
+    generated; failure leaves this service on loopback HTTP so a private VPN
+    proxy can terminate HTTPS in front of it.
+
+    Returns True when a usable pair exists afterwards; False leaves the caller on
+    loopback HTTP. Remote pairing still requires an explicitly configured HTTPS
+    VPN URL.
+    """
+    certs = BASE_DIR / "config" / "certs"
+    key_p = certs / "jarvis.key"
+    crt_p = certs / "jarvis.crt"
+    if key_p.exists() and crt_p.exists():
+        # The submitted archive accidentally included this shared certificate.
+        # Rotate that specific public-certificate fingerprint on first launch;
+        # never let the matching bundled private key remain active.
+        try:
+            fingerprint = hashlib.sha256(crt_p.read_bytes()).hexdigest().upper()
+        except OSError:
+            fingerprint = ""
+        if fingerprint == "CA6BB1BA8AD7CDE8A1FF8E5C0963BF7EF1697A9944DAF8ABDF9906B2F11165C6":
+            try:
+                key_p.unlink(missing_ok=True)
+                crt_p.unlink(missing_ok=True)
+                print("[Dashboard] Replacing the shared certificate found in the supplied archive.")
+            except OSError as exc:
+                print(f"[Dashboard] Could not replace bundled TLS key: {exc}")
+                return False
+        else:
+            return True
+
+    try:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        print("[Dashboard] cryptography not installed — serving over plain HTTP.")
+        print("[Dashboard] For HTTPS run:  pip install cryptography")
+        return False
+
+    try:
+        certs.mkdir(parents=True, exist_ok=True)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        who = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "JARVIS Dashboard"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "JARVIS"),
+        ])
+
+        # The SAN has to cover every address the phone might use: the LAN IP the
+        # QR code encodes, plus localhost when testing on the machine itself.
+        alt = [x509.DNSName("localhost"),
+               x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
+        try:
+            lan = _local_ip()
+            if not lan.startswith("127."):
+                alt.append(x509.IPAddress(ipaddress.IPv4Address(lan)))
+        except Exception:
+            pass          # no LAN address resolvable — localhost entries still work
+
+        # Timezone-aware UTC: datetime.utcnow() is deprecated from Python 3.12 on,
+        # and the builder normalises aware values to UTC itself.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(who)
+            .issuer_name(who)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(alt), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+
+        key_p.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        crt_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+        try:
+            import os as _os
+            _os.chmod(key_p, 0o600)   # best effort — largely a no-op on Windows
+        except Exception:
+            pass
+
+        print(f"[Dashboard] Generated a self-signed certificate for this machine: {certs}")
+        return True
+    except Exception as e:
+        print(f"[Dashboard] Certificate generation failed ({e}) — serving over plain HTTP.")
+        return False
+
+
+def _read(name: str) -> str:
+    return (STATIC_DIR / name).read_text(encoding="utf-8")
+
+
+# ── DashboardServer ───────────────────────────────────────────────────────────
+
+class DashboardServer:
+
+    def __init__(self):
+        self._ip                          = _local_ip()
+        # Optional private HTTPS front door (for example a Tailscale Serve URL).
+        # Set this only to an address protected by your private VPN.
+        self._remote_url                  = self._validated_remote_url(
+            os.environ.get("JARVIS_REMOTE_URL", "")
+        )
+        self._tokens: set[str]            = set()
+        self._token_issued: dict[str, float] = {}  # auth_token → issue time (for expiry)
+        self._token_keys: dict[str, str]  = {}   # auth_token → session_key
+        self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
+        self._clients: set[WebSocket]     = set()
+        self._history: list[dict]         = []
+        self._command_queue               = asyncio.Queue()
+        self._wake_callback               = None
+        self._connect_callback            = None
+        self._pending_keys: dict[str, float] = {}
+        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        self._login_attempts: dict[str, list] = {}    # ip → [timestamps]
+        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._phone_audio_ws: WebSocket | None    = None
+        self._handoff_status_callback = None
+        self._uvicorn_servers = []
+        self._uvicorn_tasks: list[asyncio.Task] = []
+        self._shutdown_requested = False
+        self._uploads_dir                 = UPLOADS_DIR
+        self._login_html                  = _read("login.html")
+        self._app_html                    = _read("app.html")
+        self.app                          = self._build_app()
+        self.twilio_app                   = self._build_twilio_app()
+
+    # ── one-time key management ───────────────────────────────────────────
+
+    @staticmethod
+    def _validated_remote_url(candidate: str) -> str:
+        value = (candidate or "").strip().rstrip("/")
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        if (parsed.scheme != "https" or not parsed.hostname
+                or parsed.username or parsed.password
+                or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment):
+            print("[Dashboard] JARVIS_REMOTE_URL must be a root HTTPS URL; remote pairing disabled.")
+            return ""
+        return value
+
+    # Session lifetimes. Bearer tokens used to live until the process exited,
+    # and "revoke" left every already-issued token valid.
+    _TOKEN_TTL_SECONDS = 12 * 3600
+    _DEVICE_TTL_SECONDS = 30 * 24 * 3600
+
+    def _token_valid(self, tok: str) -> bool:
+        """True only for an issued, unexpired, unrevoked bearer token."""
+        if not tok or tok not in self._tokens:
+            return False
+        issued = self._token_issued.get(tok)
+        if issued is None or time.time() - issued > self._TOKEN_TTL_SECONDS:
+            self._drop_token(tok)
+            return False
+        return True
+
+    def _drop_token(self, tok: str) -> None:
+        self._tokens.discard(tok)
+        self._token_issued.pop(tok, None)
+        self._token_keys.pop(tok, None)
+
+    def _remember_token(self, tok: str, session_key: str) -> None:
+        self._tokens.add(tok)
+        self._token_issued[tok] = time.time()
+        self._token_keys[tok] = session_key
+        self._aes_key(session_key)
+        # Opportunistic cleanup so abandoned sessions do not accumulate.
+        now = time.time()
+        for old, issued in list(self._token_issued.items()):
+            if now - issued > self._TOKEN_TTL_SECONDS:
+                self._drop_token(old)
+
+    def revoke_all_sessions(self) -> tuple[int, int]:
+        """End every paired device AND every live bearer token.
+
+        Returns (device_tokens_revoked, live_sessions_ended). Callable from the
+        desktop UI (for example if a paired phone is lost) as well as the API.
+        """
+        devices = len(self._device_sessions)
+        live = len(self._tokens)
+        self._device_sessions.clear()
+        self._tokens.clear()
+        self._token_issued.clear()
+        self._token_keys.clear()
+        self._aes_cache.clear()
+        self._pending_keys.clear()
+        return devices, live
+
+    def new_key(self, expiry_secs: int = 600) -> str:
+        now = time.time()
+        self._pending_keys = {k: v for k, v in self._pending_keys.items() if v > now}
+        key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
+        self._pending_keys[key] = now + expiry_secs
+        return key
+    
+    def _rate_limited(self, ip: str, window: float = 60.0, max_attempts: int = 5) -> bool:
+        now = time.time()
+        # Drop sources with no recent attempts so the table cannot grow without bound.
+        for stale in [k for k, v in self._login_attempts.items()
+                      if not v or now - v[-1] >= window]:
+            del self._login_attempts[stale]
+        hist = [t for t in self._login_attempts.get(ip, []) if now - t < window]
+        hist.append(now)
+        self._login_attempts[ip] = hist
+        return len(hist) > max_attempts
+
+
+    @staticmethod
+    def _ssl_enabled() -> bool:
+        certs = BASE_DIR / "config" / "certs"
+        return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
+
+    def get_url(self) -> str:
+        if self._remote_url:
+            return self._remote_url
+        proto = "https" if self._ssl_enabled() else "http"
+        return f"{proto}://{self._ip}:{PORT}"
+
+    def get_manual_url(self) -> str:
+        """Address for manual entry, using the private HTTPS URL when configured."""
+        if self._remote_url:
+            return self._remote_url.removeprefix("https://").removeprefix("http://")
+        if self._ssl_enabled():
+            return f"{self._ip}:{PORT + 1}"
+        return f"{self._ip}:{PORT}"
+
+    def _aes_key(self, session_key: str) -> bytes:
+        if session_key not in self._aes_cache:
+            self._aes_cache[session_key] = _derive_key(session_key)
+        return self._aes_cache[session_key]
+
+    def _decrypt(self, token: str, enc_b64: str) -> str | None:
+        sk = self._token_keys.get(token)
+        if not sk:
+            return None
+        try:
+            return _decrypt_cbc(self._aes_key(sk), enc_b64)
+        except Exception:
+            return None
+
+    # ── callbacks ────────────────────────────────────────────────────────
+
+    def set_wake_callback(self, fn) -> None:
+        self._wake_callback = fn
+
+    def set_connect_callback(self, fn) -> None:
+        self._connect_callback = fn
+
+    def set_handoff_status_callback(self, fn) -> None:
+        """Provide authenticated proximity beacon metadata to a paired phone."""
+        self._handoff_status_callback = fn
+
+    # ── broadcast ────────────────────────────────────────────────────────
+
+    async def broadcast(self, msg: dict) -> None:
+        self._history.append(msg)
+        if len(self._history) > 300:
+            self._history = self._history[-300:]
+        dead: set[WebSocket] = set()
+        for ws in list(self._clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.add(ws)
+        self._clients -= dead
+
+    async def send_phone_audio(self, data: bytes) -> bool:
+        """Send one PCM playback frame to the currently active paired phone."""
+        ws = self._phone_audio_ws
+        if ws is None:
+            return False
+        try:
+            await ws.send_bytes(data)
+            return True
+        except Exception:
+            if self._phone_audio_ws is ws:
+                self._phone_audio_ws = None
+            return False
+
+    # ── FastAPI app ───────────────────────────────────────────────────────
+
+    def _build_app(self) -> "FastAPI":
+        app = FastAPI(docs_url=None, redoc_url=None)
+
+        def _auth(req: Request) -> bool:
+            tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            return self._token_valid(tok)
+
+        # serve CryptoJS from local cache, fallback to CDN redirect
+        @app.get("/static/crypto.js")
+        async def serve_crypto():
+            if _CRYPTOJS_FILE.exists():
+                return FileResponse(str(_CRYPTOJS_FILE),
+                                    media_type="application/javascript")
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(_CRYPTOJS_CDN)
+
+        @app.get("/login", response_class=HTMLResponse)
+        async def login_page():
+            return HTMLResponse(self._login_html)
+
+        @app.get("/", response_class=HTMLResponse)
+        async def index():
+            # Auth is handled client-side via sessionStorage bearer token.
+            # Server-side header auth can't work here because browser navigations
+            # don't send custom headers (location.href doesn't carry Authorization).
+            html = (self._app_html
+                    .replace("__IP__", self._ip)
+                    .replace("__PORT__", str(PORT)))
+            return HTMLResponse(html)
+
+        @app.post("/login")
+        async def login(req: Request):
+            from core import security
+            client_ip = req.client.host if req.client else "unknown"
+            if self._rate_limited(client_ip):
+                security.audit("dashboard_login", "login", "SENSITIVE", "denied",
+                                f"rate-limited: {client_ip}")
+                return JSONResponse({"ok": False, "error": "Too many attempts. Wait a minute."},
+                                    status_code=429)
+            body    = await req.json()
+            entered = str(body.get("pin", "")).strip().upper()
+            now     = time.time()
+            if entered in self._pending_keys and self._pending_keys[entered] > now:
+                del self._pending_keys[entered]          # one-time use
+                tok = secrets.token_urlsafe(32)
+                self._remember_token(tok, entered)
+                security.audit("dashboard_login", "login", "SENSITIVE", "ran", f"ip={client_ip}")
+                if self._connect_callback:
+                    self._connect_callback()
+                asyncio.create_task(self.broadcast(
+                    {"type": "sys", "text": "Remote connection established."}
+                ))
+                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
+                return JSONResponse({"ok": True, "token": tok})
+            security.audit("dashboard_login", "login", "SENSITIVE", "denied",
+                            f"bad key from ip={client_ip}")
+            return JSONResponse({"ok": False, "error": "Invalid or expired key"},
+                                status_code=401)
+
+
+        @app.get("/auto-login")
+        async def auto_login(req: Request, key: str = ""):
+            """QR code target — validates one-time key, creates session, redirects phone."""
+            from core import security
+            client_ip = req.client.host if req.client else "unknown"
+            # QR auto-login creates the same authenticated session as /login.
+            # Apply the same per-source throttle here too; otherwise a leaked or
+            # guessed six-character pairing code could be brute-forced through
+            # this GET route without touching the /login limiter.
+            if self._rate_limited(client_ip):
+                security.audit("dashboard_login", "auto_login", "SENSITIVE", "denied",
+                               f"rate-limited: {client_ip}")
+                return HTMLResponse(
+                    "<!doctype html><html><body><h2>Too many pairing attempts</h2>"
+                    "<p>Wait a minute, then generate a new QR code in JARVIS.</p></body></html>",
+                    status_code=429,
+                    headers={"Cache-Control": "no-store"},
+                )
+            now = time.time()
+            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+                security.audit("dashboard_login", "auto_login", "SENSITIVE", "denied",
+                               f"invalid or expired QR key: {client_ip}")
+                return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+<style>
+  body{background:#07090f;color:#dde3ed;font-family:sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
+  h2{color:#f87171;margin-bottom:12px}p{color:#5e6a7e;font-size:14px}
+</style></head>
+<body><div><h2>Link Expired</h2>
+<p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
+</div></body></html>""")
+
+            del self._pending_keys[key]
+            tok     = secrets.token_urlsafe(32)
+            dev_tok = secrets.token_urlsafe(32)
+            self._remember_token(tok, key)
+            self._device_sessions[dev_tok] = {"session_key": key, "issued": time.time()}
+            security.audit("dashboard_login", "auto_login", "SENSITIVE", "ran",
+                           f"QR pairing: {client_ip}")
+
+            if self._connect_callback:
+                self._connect_callback()
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Remote connection established via QR code."}
+            ))
+
+            return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+<style>
+  body{{background:#07090f;color:#dde3ed;font-family:sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}}
+  p{{color:#5e6a7e;font-size:14px}}
+</style></head>
+<body>
+<script>
+  sessionStorage.setItem('jarvis_token','{tok}');
+  sessionStorage.setItem('jarvis_key','{key}');
+  localStorage.setItem('jarvis_device_token','{dev_tok}');
+  setTimeout(function(){{location.replace('/')}},400);
+</script>
+<p>Connecting to JARVIS…</p>
+</body></html>""", headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+        @app.post("/api/device-login")
+        async def device_login_ep(req: Request):
+            """Return a fresh auth token for a previously paired device token."""
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False}, status_code=400)
+            dev_tok = (body.get("device_token") or "").strip()
+            if not dev_tok or dev_tok not in self._device_sessions:
+                return JSONResponse({"ok": False}, status_code=401)
+            device = self._device_sessions[dev_tok]
+            if time.time() - float(device.get("issued", 0)) > self._DEVICE_TTL_SECONDS:
+                self._device_sessions.pop(dev_tok, None)
+                return JSONResponse({"ok": False}, status_code=401)
+            session_key = device["session_key"]
+            tok = secrets.token_urlsafe(32)
+            self._remember_token(tok, session_key)
+            if self._connect_callback:
+                self._connect_callback()
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Known device reconnected automatically."}
+            ))
+            return JSONResponse({"ok": True, "token": tok, "key": session_key})
+
+        @app.get("/api/handoff/status")
+        async def handoff_status(req: Request):
+            """Authenticated proximity status; never includes audio or personal data."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            active_phone = self._phone_audio_ws is not None
+            state = {}
+            if self._handoff_status_callback:
+                try:
+                    state = self._handoff_status_callback() or {}
+                except Exception:
+                    state = {}
+            state["phoneConnected"] = active_phone
+            state["handoff"] = bool(active_phone and state.get("phoneRouteActive", False))
+            return JSONResponse(state, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/revoke-devices")
+        async def revoke_devices(req: Request):
+            """Invalidate all persistent device tokens (admin action)."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            count, live = self.revoke_all_sessions()
+            for ws in list(self._clients) + ([self._phone_audio_ws] if self._phone_audio_ws else []):
+                try:
+                    await ws.close(code=4003)
+                except Exception:
+                    pass
+            self._clients.clear()
+            self._phone_audio_ws = None
+            from core import security
+            security.audit("dashboard_login", "revoke_devices", "SENSITIVE", "ran",
+                           f"devices={count} sessions={live}")
+            return JSONResponse({"ok": True, "revoked": count, "sessions_ended": live})
+
+        @app.post("/api/command")
+        async def command(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body  = await req.json()
+            token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            enc   = body.get("enc", "")
+            if enc:
+                text = self._decrypt(token, enc)
+                if text is None:
+                    return JSONResponse({"error": "Decryption failed"}, status_code=400)
+            else:
+                text = (body.get("text") or "").strip()
+            if text:
+                await self._command_queue.put(text)
+                if self._wake_callback:
+                    self._wake_callback()
+            return JSONResponse({"ok": True})
+
+        @app.post("/api/wake")
+        async def wake_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if self._wake_callback:
+                self._wake_callback()
+            return JSONResponse({"ok": True})
+
+        # ── Phone mic real-time audio → Gemini Live ──────────────────────────
+
+        @app.websocket("/ws/phone-audio")
+        async def phone_audio_ws(websocket: WebSocket, token: str = ""):
+            tok = token.strip()
+            if not self._token_valid(tok):
+                await websocket.close(code=4001)
+                return
+            await websocket.accept()
+            previous = self._phone_audio_ws
+            if previous is not None and previous is not websocket:
+                try:
+                    await previous.close(code=4002, reason="Phone voice session replaced")
+                except Exception:
+                    pass
+            self._phone_audio_ws = websocket
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Phone automatic handoff armed."}
+            ))
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    try:
+                        self._phone_audio_queue.put_nowait(
+                            {"data": data, "mime_type": "audio/pcm"}
+                        )
+                    except asyncio.QueueFull:
+                        pass  # drop frame rather than block
+            except WebSocketDisconnect:
+                pass
+            finally:
+                if self._phone_audio_ws is websocket:
+                    self._phone_audio_ws = None
+                asyncio.create_task(self.broadcast(
+                    {"type": "sys", "text": "Phone automatic handoff disarmed."}
+                ))
+
+        # ── File sharing ──────────────────────────────────────────────────────
+
+        def _safe_filename(raw: str) -> str:
+            name = Path(raw).name                          # strip path components
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
+            return name or "upload"
+
+        if _UPLOAD_OK:
+            @app.post("/api/upload")
+            async def upload_file(req: Request, file: UploadFile = FastAPIFile(...)):
+                if not _auth(req):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+                # A paired device must not be able to fill the disk.
+                try:
+                    existing = [f for f in self._uploads_dir.iterdir() if f.is_file()]
+                    if (len(existing) >= 500
+                            or sum(f.stat().st_size for f in existing) > 2 * 1024 ** 3):
+                        return JSONResponse({"error": "Upload folder is full"}, status_code=507)
+                except OSError:
+                    pass
+                safe = _safe_filename(file.filename or "upload")
+                dest = self._uploads_dir / safe
+                stem, suffix = Path(safe).stem, Path(safe).suffix
+                counter = 1
+                while dest.exists():
+                    dest = self._uploads_dir / f"{stem}_{counter}{suffix}"
+                    counter += 1
+
+                size = 0
+                max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+                try:
+                    with open(dest, "wb") as fout:
+                        while True:
+                            chunk = await file.read(65536)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > max_bytes:
+                                fout.close()
+                                dest.unlink(missing_ok=True)
+                                return JSONResponse(
+                                    {"error": f"File too large (max {MAX_UPLOAD_MB} MB)"},
+                                    status_code=413,
+                                )
+                            fout.write(chunk)
+                except Exception as exc:
+                    try:
+                        dest.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return JSONResponse({"error": str(exc)}, status_code=500)
+
+                asyncio.create_task(self.broadcast({
+                    "type": "file_received",
+                    "name": dest.name,
+                    "size": size,
+                    "saved_to": str(self._uploads_dir),
+                }))
+                return JSONResponse({"ok": True, "name": dest.name, "size": size})
+        else:
+            @app.post("/api/upload")
+            async def upload_unavailable(req: Request):
+                return JSONResponse(
+                    {"error": "File uploads require: pip install python-multipart"},
+                    status_code=503,
+                )
+
+        @app.get("/api/files")
+        async def list_files(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            files = []
+            try:
+                for f in sorted(
+                    (p for p in self._uploads_dir.iterdir() if p.is_file()),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                ):
+                    files.append({"name": f.name, "size": f.stat().st_size})
+            except Exception:
+                pass
+            return JSONResponse({"files": files})
+
+        @app.get("/uploads/{filename}")
+        async def download_file(filename: str, token: str = ""):
+            # Auth via query param — browser <a download> can't send custom headers
+            tok = token.strip()
+            if not self._token_valid(tok):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            safe = _safe_filename(filename)
+            base = self._uploads_dir.resolve()
+            path = (base / safe).resolve()
+            # pathlib joins "C:name" onto the *current directory of drive C*, not
+            # onto uploads/, so confirm the result is a direct child of uploads/.
+            if path.parent != base or not path.exists() or not path.is_file():
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            return FileResponse(str(path), filename=safe)
+
+        @app.websocket("/ws")
+        async def ws_ep(websocket: WebSocket, token: str = ""):
+            tok = token.strip()
+            if not self._token_valid(tok):
+                await websocket.close(code=4001)
+                return
+            await websocket.accept()
+            self._clients.add(websocket)
+            for entry in self._history[-50:]:
+                try:
+                    await websocket.send_json(entry)
+                except Exception:
+                    break
+            try:
+                while True:
+                    data = await websocket.receive_json()
+                    if data.get("type") == "command":
+                        enc = data.get("enc", "")
+                        t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
+                        if t:
+                            await self._command_queue.put(t)
+                            if self._wake_callback:
+                                self._wake_callback()
+            except WebSocketDisconnect:
+                pass
+            finally:
+                self._clients.discard(websocket)
+
+        return app
+
+    def _build_twilio_app(self) -> "FastAPI":
+        """A public-tunnel-safe app containing only Twilio endpoints.
+
+        It binds to a different loopback port from the authenticated phone
+        dashboard. Tunneling this listener cannot expose dashboard routes.
+        """
+        app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+        @app.post("/api/twilio/call")
+        async def twilio_call_ep(req: Request):
+            from plugins.phone_call import (
+                handle_incoming_call, is_twilio_configured,
+                twilio_public_urls, validate_twilio_request,
+            )
+            if not is_twilio_configured():
+                return PlainTextResponse("Phone service unavailable.", status_code=503)
+            try:
+                form = await req.form()
+            except Exception:
+                return PlainTextResponse("Expected Twilio form request.", status_code=400)
+
+            urls = twilio_public_urls()
+            signature = req.headers.get("X-Twilio-Signature", "")
+            if not urls or not signature:
+                return PlainTextResponse("Forbidden", status_code=403)
+
+            # Pin the host and route to the configured public callback rather
+            # than trusting Host/X-Forwarded-* supplied by an arbitrary tunnel.
+            callback = urls[0]
+            incoming_query = req.scope.get("query_string", b"").decode("latin-1")
+            if incoming_query:
+                from urllib.parse import urlsplit, urlunsplit
+                parsed = urlsplit(callback)
+                callback = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                                       incoming_query, ""))
+            if not validate_twilio_request(callback, form, signature):
+                return PlainTextResponse("Forbidden", status_code=403)
+
+            return PlainTextResponse(
+                handle_incoming_call(dict(form)), media_type="application/xml"
+            )
+
+        @app.websocket("/media-stream")
+        async def twilio_media_stream_ws(websocket: WebSocket, token: str = ""):
+            from plugins.phone_call import (
+                handle_media_stream, get_twilio_config, twilio_public_urls,
+                validate_twilio_stream,
+            )
+            urls = twilio_public_urls()
+            signature = websocket.headers.get("X-Twilio-Signature", "")
+            if not urls or not validate_twilio_stream(
+                _twilio_stream_request_url(urls[1], token), signature, token
+            ):
+                await websocket.close(code=1008)
+                return
+
+            await websocket.accept()
+            # Twilio may send `connected` before `start`; require a valid start
+            # from the configured account before opening a Gemini session.
+            try:
+                msg = None
+                for _ in range(3):
+                    candidate = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+                    if candidate.get("event") == "start":
+                        msg = candidate
+                        break
+                start = (msg or {}).get("start", {})
+                account_sid = str(get_twilio_config().get("account_sid", ""))
+                call_sid = str(start.get("callSid", ""))
+                if (not msg or not call_sid.startswith("CA")
+                        or str(start.get("accountSid", "")) != account_sid):
+                    await websocket.close(code=1008)
+                    return
+                custom = start.get("customParameters", {})
+                await handle_media_stream(websocket, {
+                    "call_sid": call_sid,
+                    "caller_name": custom.get("caller_name", "Caller"),
+                    "caller_number": custom.get("caller_number", "Unknown"),
+                })
+            except Exception as exc:
+                print(f"[Twilio] Media stream rejected or failed ({type(exc).__name__}).")
+                try:
+                    await websocket.close(code=1011)
+                except Exception:
+                    pass
+
+        return app
+
+    # ── serve ─────────────────────────────────────────────────────────────
+
+    async def _serve_alias(self) -> None:
+        """Legacy HTTPS alias is intentionally disabled; serve only on PORT."""
+        return
+
+    async def serve(self) -> None:
+        if not _DEPS_OK:
+            print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
+            print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
+            return
+
+        # Generate the TLS pair on first run so no private key ships in the repo.
+        certs_ok = _ensure_certs()
+
+        use_ssl  = certs_ok and self._ssl_enabled()
+        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
+        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
+
+        cfg = uvicorn.Config(
+            # The dashboard is reached through the local UI or a private VPN
+            # reverse proxy. Never expose its control API directly on every NIC.
+            self.app, host="127.0.0.1", port=PORT, log_level="warning",
+            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
+        )
+
+        proto = "https" if use_ssl else "http"
+        print(f"[Dashboard] Local-only listener: {proto}://127.0.0.1:{PORT}")
+        print("[Twilio] Dedicated local-only listener: http://127.0.0.1:8001 (tunnel only this port)")
+        if self._remote_url:
+            print(f"[Dashboard] Private remote URL: {self._remote_url}")
+        else:
+            print("[Dashboard] Remote pairing disabled; set JARVIS_REMOTE_URL to a private HTTPS VPN URL.")
+        twilio_cfg = uvicorn.Config(
+            self.twilio_app, host="127.0.0.1", port=8001, log_level="warning"
+        )
+        self._uvicorn_servers = [uvicorn.Server(cfg), uvicorn.Server(twilio_cfg)]
+        if self._shutdown_requested:
+            for server in self._uvicorn_servers:
+                server.should_exit = True
+        self._uvicorn_tasks = [
+            asyncio.create_task(server.serve()) for server in self._uvicorn_servers
+        ]
+        try:
+            await asyncio.gather(*self._uvicorn_tasks)
+        finally:
+            self._uvicorn_tasks.clear()
+            self._uvicorn_servers.clear()
+
+    async def shutdown(self) -> None:
+        """Ask both local Uvicorn listeners to finish their lifespan cleanly."""
+        self._shutdown_requested = True
+        for server in self._uvicorn_servers:
+            server.should_exit = True
+        tasks = tuple(self._uvicorn_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.11.2/dist/maplibre-gl.css">
+  <style>
+    html, body, #map { width:100%; height:100%; margin:0; overflow:hidden; background:#071116; }
+    .maplibregl-ctrl-group { background:#101c21; border:1px solid #39545a; }
+    .maplibregl-ctrl button { filter: invert(.82) sepia(.22) saturate(.55) hue-rotate(115deg); }
+    .maplibregl-ctrl-attrib { color:#d3dedb!important; background:rgba(5,15,19,.78)!important; }
+    .maplibregl-ctrl-attrib a { color:#8de0d0!important; }
+    #credits { position:absolute;bottom:7px;left:8px;z-index:2;padding:4px 7px;
+      color:#d3dedb;background:rgba(5,15,19,.78);font:10px Arial,sans-serif; }
+    #credits a { color:#8de0d0; }
+    #route-summary { position:absolute;top:14px;left:14px;z-index:3;max-width:min(440px,70vw);
+      padding:10px 13px;border:1px solid #37e0d0aa;border-left:3px solid #37e0d0;
+      background:rgba(5,15,19,.92);box-shadow:0 5px 24px #0009;color:#d7efeb;
+      font:12px 'Consolas',monospace;line-height:1.5;pointer-events:none; }
+    #route-summary[hidden] { display:none; }
+    #route-summary .route-label { color:#71d4c2;font-size:10px;letter-spacing:.12em; }
+    #route-summary .route-pair { color:#a9bbb8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
+    #route-summary .route-stats { display:flex;gap:20px;margin-top:4px; }
+    #route-summary strong { color:#f2fbf8;font-size:15px; }
+    #route-summary small { color:#9aacaa;font-size:10px; }
+    #flight-summary { position:absolute;top:14px;left:14px;z-index:4;width:min(380px,74vw);max-height:62vh;
+      overflow:hidden;border:1px solid #41d9e5aa;border-left:3px solid #41d9e5;
+      background:rgba(3,10,18,.94);box-shadow:0 5px 28px #000b;color:#d7eff5;
+      font:11px 'Consolas',monospace;pointer-events:auto; }
+    #flight-summary[hidden] { display:none; }
+    #flight-head { padding:10px 12px 7px;border-bottom:1px solid #41d9e544; }
+    #flight-title { color:#70e8f1;font-size:11px;letter-spacing:.13em; }
+    #flight-meta { color:#9aabb7;font-size:10px;margin-top:4px; }
+    #flight-list { overflow:auto;max-height:calc(62vh - 58px); }
+    .flight-row { display:block;width:100%;padding:8px 11px;text-align:left;color:#d8ebf0;
+      background:transparent;border:0;border-bottom:1px solid #47708033;font:10px 'Consolas',monospace;cursor:pointer; }
+    .flight-row:hover,.flight-row:focus { background:#0d2834;color:#8df5ff;outline:none; }
+    .flight-row strong { color:#74e8f0;font-size:11px; }
+    .flight-row small { display:block;color:#9aabb7;margin-top:3px;line-height:1.45; }
+    .flight-center { width:20px;height:20px;border:2px solid #f5cc64;border-radius:50%;
+      background:#f5cc6430;box-shadow:0 0 0 8px #f5cc6420,0 0 22px #f5cc64; }
+    .flight-blip { width:25px;height:25px;display:grid;place-items:center;border-radius:50%;
+      background:#07141bee;border:1px solid #73f1ff;box-shadow:0 0 8px #39d9f7,0 0 19px #39d9f777; }
+    .flight-arrow { color:#a9fbff;font:19px Arial,sans-serif;text-shadow:0 0 8px #5beaff; }
+    .flight-blip.stale { filter:saturate(.45);opacity:.72; }
+    .jarvis-pin { width:20px;height:20px;border:2px solid #fff0bd;border-radius:50%;
+      background:#ff9f55;box-shadow:0 0 0 7px #ff9f5544,0 0 20px #ff9f55; }
+    .jarvis-start { background:#66e0cf;box-shadow:0 0 0 7px #66e0cf44,0 0 20px #66e0cf; }
+  </style>
+</head>
+<body>
+<div id="map" aria-label="Interactive three-dimensional Earth map"></div>
+<div id="route-summary" hidden aria-live="polite"></div>
+<div id="flight-summary" hidden aria-live="polite"><div id="flight-head"><div id="flight-title">LIVE AIRCRAFT / RADAR</div><div id="flight-meta"></div></div><div id="flight-list"></div></div>
+<div id="credits"><a href="https://cloudless.eox.at">EOxCloudless</a> · © OpenStreetMap contributors · route: OSRM / FOSSGIS</div>
+<script>
+  window.addEventListener('error', () => {
+    if (!window.jarvisEarth) document.title = 'JARVIS_EARTH_ERROR';
+  });
+  window.addEventListener('unhandledrejection', () => {
+    if (!window.jarvisEarth) document.title = 'JARVIS_EARTH_ERROR';
+  });
+</script>
+<script type="module">
+  import * as maplibregl from 'https://unpkg.com/maplibre-gl@6.11.2/dist/maplibre-gl.mjs';
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    center: [15, 18],
+    zoom: 0.65,
+    style: {
+      version: 8,
+      projection: { type: 'globe' },
+      sources: {
+        satellite: {
+          type: 'raster',
+          tiles: ['https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg'],
+          tileSize: 256,
+          maxzoom: 13,
+          attribution: '<a href="https://cloudless.eox.at">EOxCloudless</a> by EOX IT Services GmbH · Contains modified Copernicus Sentinel data 2020'
+        },
+        streets: {
+          type: 'raster',
+          tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+          tileSize: 256,
+          maxzoom: 19,
+          attribution: '<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>'
+        }
+      },
+      layers: [
+        { id: 'satellite', type: 'raster', source: 'satellite', layout: { visibility: 'visible' } },
+        { id: 'streets', type: 'raster', source: 'streets', layout: { visibility: 'none' } }
+      ],
+      sky: {
+        'atmosphere-blend': ['interpolate', ['linear'], ['zoom'], 0, 1, 5, 1, 7, 0]
+      },
+      light: { anchor: 'map', position: [1.5, 90, 80] }
+    },
+    attributionControl: { compact: false },
+    maxZoom: 19,
+    minZoom: 0
+  });
+
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+  map.addControl(new maplibregl.GlobeControl(), 'top-right');
+
+  let rotating = true;
+  let destinationMarker = null;
+  let startMarker = null;
+  let flightCenterMarker = null;
+  let flightMarkers = [];
+  let flightPoints = new Map();
+  let rotationTimer = null;
+  let mapLoaded = false;
+  const deferredMapCalls = [];
+  const whenMapLoaded = callback => mapLoaded ? callback() : deferredMapCalls.push(callback);
+  const stopForInput = () => { if (rotating) window.jarvisEarth.setRotation(false); };
+  map.on('dragstart', stopForInput);
+  map.on('zoomstart', stopForInput);
+  map.on('rotatestart', stopForInput);
+  map.on('load', () => {
+    mapLoaded = true;
+    document.title = 'JARVIS_EARTH_READY';
+    while (deferredMapCalls.length) deferredMapCalls.shift()();
+    rotationTimer = window.setInterval(() => {
+      if (rotating && map.getZoom() < 2.7) {
+        map.rotateTo((map.getBearing() + 0.12) % 360, { duration: 0 });
+      }
+    }, 40);
+  });
+  map.on('error', event => {
+    if (event && event.error) console.warn('JARVIS Earth map:', event.error.message || event.error);
+  });
+
+  const marker = (className) => {
+    const el = document.createElement('div');
+    el.className = `jarvis-pin ${className || ''}`;
+    return el;
+  };
+  const bboxForRoute = coordinates => {
+    const bounds = new maplibregl.LngLatBounds(coordinates[0], coordinates[0]);
+    coordinates.forEach(point => bounds.extend(point));
+    return bounds;
+  };
+  const clearFlights = () => {
+    flightMarkers.forEach(item => item.remove());
+    flightMarkers = [];
+    flightPoints.clear();
+    if (flightCenterMarker) flightCenterMarker.remove();
+    flightCenterMarker = null;
+    document.getElementById('flight-summary').hidden = true;
+    if (map.getSource('flight-rings')) map.getSource('flight-rings').setData({type:'FeatureCollection',features:[]});
+  };
+  const circleFeature = (center, radiusKm) => {
+    const coordinates = [];
+    const lat1 = center.latitude * Math.PI / 180;
+    const lon1 = center.longitude * Math.PI / 180;
+    const angular = radiusKm / 6371.0;
+    for (let i = 0; i <= 96; i++) {
+      const bearing = i * 2 * Math.PI / 96;
+      const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angular) + Math.cos(lat1) * Math.sin(angular) * Math.cos(bearing));
+      const lon2 = lon1 + Math.atan2(Math.sin(bearing) * Math.sin(angular) * Math.cos(lat1), Math.cos(angular) - Math.sin(lat1) * Math.sin(lat2));
+      coordinates.push([((lon2 * 180 / Math.PI + 540) % 360) - 180, lat2 * 180 / Math.PI]);
+    }
+    return {type:'Feature',properties:{radius:radiusKm},geometry:{type:'Polygon',coordinates:[coordinates]}};
+  };
+  const flightDetails = flight => {
+    const altitude = flight.altitude_m == null ? 'ALT N/A' : `ALT ${Math.round(flight.altitude_m * 3.28084).toLocaleString()} ft`;
+    const speed = flight.velocity_mps == null ? 'SPD N/A' : `SPD ${Math.round(flight.velocity_mps * 3.6)} km/h`;
+    const heading = flight.heading == null ? 'HDG N/A' : `HDG ${Math.round(flight.heading)}°`;
+    const climb = flight.vertical_rate_mps == null ? 'VERT N/A' : `VERT ${Math.round(flight.vertical_rate_mps * 196.85)} ft/min`;
+    return `${flight.callsign} · ICAO ${flight.icao24} · ${flight.country} · ${altitude} · ${speed} · ${heading} · ${climb} · SQUAWK ${flight.squawk} · ${flight.distance_km.toFixed(1)} km away · report ${flight.age_s}s ago`;
+  };
+
+  window.jarvisEarth = {
+    setRotation(enabled) {
+      rotating = Boolean(enabled);
+      whenMapLoaded(() => {
+        if (rotating && map.getZoom() >= 2.7) map.easeTo({ zoom: 0.65, duration: 900 });
+      });
+    },
+    toggleRotation() {
+      rotating = !rotating;
+      whenMapLoaded(() => {
+        if (rotating && map.getZoom() >= 2.7) map.easeTo({ zoom: 0.65, duration: 900 });
+      });
+      return rotating;
+    },
+    resetGlobe() {
+      rotating = true;
+      whenMapLoaded(() => {
+        clearFlights();
+        document.getElementById('route-summary').hidden = true;
+        if (destinationMarker) destinationMarker.remove();
+        if (startMarker) startMarker.remove();
+        destinationMarker = null;
+        startMarker = null;
+        document.getElementById('route-summary').hidden = true;
+        if (map.getSource('jarvis-route')) {
+          map.getSource('jarvis-route').setData({ type:'FeatureCollection', features:[] });
+        }
+        map.setLayoutProperty('satellite', 'visibility', 'visible');
+        map.setLayoutProperty('streets', 'visibility', 'none');
+        map.easeTo({ center:[15,18], zoom:0.65, bearing:0, pitch:0, duration:1000 });
+      });
+    },
+    setBase(name) {
+      whenMapLoaded(() => {
+        map.setLayoutProperty('satellite', 'visibility', name === 'satellite' ? 'visible' : 'none');
+        map.setLayoutProperty('streets', 'visibility', name === 'streets' ? 'visible' : 'none');
+      });
+    },
+    focusPlace(place, zoom) {
+      rotating = false;
+      whenMapLoaded(() => {
+        clearFlights();
+        map.setLayoutProperty('satellite', 'visibility', zoom >= 8 ? 'none' : 'visible');
+        map.setLayoutProperty('streets', 'visibility', zoom >= 8 ? 'visible' : 'none');
+        if (destinationMarker) destinationMarker.remove();
+        if (startMarker) startMarker.remove();
+        startMarker = null;
+        document.getElementById('route-summary').hidden = true;
+        if (map.getSource('jarvis-route')) {
+          map.getSource('jarvis-route').setData({ type:'FeatureCollection', features:[] });
+        }
+        destinationMarker = new maplibregl.Marker({ element: marker('') })
+          .setLngLat([place.lon, place.lat])
+          .setPopup(new maplibregl.Popup({ offset: 18 }).setText(place.name))
+          .addTo(map);
+        map.flyTo({ center: [place.lon, place.lat], zoom, essential: true, speed: 0.85, curve: 1.45 });
+      });
+    },
+    showRoute(route) {
+      rotating = false;
+      whenMapLoaded(() => {
+        clearFlights();
+        map.setLayoutProperty('satellite', 'visibility', 'none');
+        map.setLayoutProperty('streets', 'visibility', 'visible');
+        if (destinationMarker) destinationMarker.remove();
+        if (startMarker) startMarker.remove();
+        const start = route.start;
+        const end = route.end;
+        const summary = document.getElementById('route-summary');
+        const km = (Number(route.distance_m) / 1000).toLocaleString(undefined, {minimumFractionDigits:1, maximumFractionDigits:1});
+        const seconds = Math.max(0, Number(route.duration_s) || 0);
+        const totalMinutes = Math.max(1, Math.round(seconds / 60));
+        const days = Math.floor(totalMinutes / 1440);
+        const hours = Math.floor((totalMinutes % 1440) / 60);
+        const minutes = totalMinutes % 60;
+        const eta = days ? `${days} d ${hours} hr ${minutes} min` : hours ? `${hours} hr ${minutes} min` : `${minutes} min`;
+        if (route.route_type === 'air') {
+          summary.innerHTML = `<div class="route-label">GREAT-CIRCLE AIR DISTANCE</div><div class="route-pair"></div><div class="route-stats"><span><strong>${km} km</strong><br><small>DIRECT DISTANCE · AIR-PATH DISPLAY</small></span></div>`;
+        } else {
+          summary.innerHTML = `<div class="route-label">ROAD DISTANCE · DRIVE ESTIMATE (NO LIVE TRAFFIC)</div><div class="route-pair"></div><div class="route-stats"><span><strong>${km} km</strong><br><small>ROAD DISTANCE</small></span><span><strong>~${eta}</strong><br><small>ESTIMATED DRIVE</small></span></div>`;
+        }
+        summary.querySelector('.route-pair').textContent = `${start.name}  →  ${end.name}`;
+        summary.hidden = false;
+        startMarker = new maplibregl.Marker({ element: marker('jarvis-start') })
+          .setLngLat([start.lon, start.lat])
+          .setPopup(new maplibregl.Popup({ offset: 18 }).setText(`START · ${start.name}`))
+          .addTo(map);
+        destinationMarker = new maplibregl.Marker({ element: marker('') })
+          .setLngLat([end.lon, end.lat])
+          .setPopup(new maplibregl.Popup({ offset: 18 }).setText(`DESTINATION · ${end.name}`))
+          .addTo(map);
+        const data = { type: 'Feature', properties: {}, geometry: route.geometry };
+        if (map.getSource('jarvis-route')) {
+          map.getSource('jarvis-route').setData(data);
+        } else {
+          map.addSource('jarvis-route', { type: 'geojson', data });
+          map.addLayer({
+            id: 'jarvis-route-outline', type: 'line', source: 'jarvis-route',
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: { 'line-color': '#071116', 'line-width': 9, 'line-opacity': 0.75 }
+          });
+          map.addLayer({
+            id: 'jarvis-route-line', type: 'line', source: 'jarvis-route',
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: { 'line-color': '#37e0d0', 'line-width': 5, 'line-opacity': 0.95 }
+          });
+        }
+        map.fitBounds(bboxForRoute(route.geometry.coordinates), { padding: 80, duration: 1200, maxZoom: 13 });
+      });
+    },
+    requestLocation() {
+      if (!navigator.geolocation) {
+        document.title = 'JARVIS_LOCATION_ERROR:unsupported';
+        return;
+      }
+      document.title = 'JARVIS_LOCATION_PENDING';
+      navigator.geolocation.getCurrentPosition(position => {
+        document.title = `JARVIS_LOCATION:${position.coords.latitude}:${position.coords.longitude}`;
+      }, error => {
+        document.title = `JARVIS_LOCATION_ERROR:${error && error.code || 'unknown'}`;
+      }, {enableHighAccuracy:false, maximumAge:60000, timeout:15000});
+    },
+    showFlights(data) {
+      rotating = false;
+      whenMapLoaded(() => {
+        clearFlights();
+        document.getElementById('route-summary').hidden = true;
+        map.setLayoutProperty('satellite', 'visibility', 'visible');
+        map.setLayoutProperty('streets', 'visibility', 'none');
+        if (map.getSource('jarvis-route')) {
+          map.getSource('jarvis-route').setData({type:'FeatureCollection',features:[]});
+        }
+        if (destinationMarker) destinationMarker.remove();
+        if (startMarker) startMarker.remove();
+        destinationMarker = startMarker = null;
+        const center = data.center;
+        map.flyTo({center:[center.longitude, center.latitude], zoom:9.1, duration:1100, essential:true});
+        const features = [10,25,50].map(radius => circleFeature(center, radius));
+        const collection = {type:'FeatureCollection',features};
+        if (map.getSource('flight-rings')) map.getSource('flight-rings').setData(collection);
+        else {
+          map.addSource('flight-rings', {type:'geojson',data:collection});
+          map.addLayer({id:'flight-rings-fill',type:'fill',source:'flight-rings',paint:{'fill-color':'#22cde5','fill-opacity':0.025}});
+          map.addLayer({id:'flight-rings-line',type:'line',source:'flight-rings',paint:{'line-color':'#55deec','line-opacity':0.42,'line-width':1.2,'line-dasharray':[2,2]}});
+        }
+        const centerEl = document.createElement('div');
+        centerEl.className = 'flight-center';
+        flightCenterMarker = new maplibregl.Marker({element:centerEl}).setLngLat([center.longitude,center.latitude]).addTo(map);
+        const flights = Array.isArray(data.aircraft) ? data.aircraft : [];
+        const list = document.getElementById('flight-list');
+        list.replaceChildren();
+        document.getElementById('flight-meta').textContent = `${flights.length} AIRCRAFT · WITHIN ${data.radius_km} KM · ${data.source} · ${new Date(data.updated * 1000).toLocaleTimeString()} · REFRESH ${Math.max(1, Math.ceil((data.refresh_seconds || 300) / 60))} MIN`;
+        const summary = document.getElementById('flight-summary');
+        summary.hidden = false;
+        if (!flights.length) {
+          const empty = document.createElement('div');
+          empty.className = 'flight-row';
+          empty.textContent = 'No recent airborne positions reported inside this radar radius.';
+          list.appendChild(empty);
+        }
+        flights.forEach(flight => {
+          const element = document.createElement('div');
+          element.className = `flight-blip${flight.age_s > 90 ? ' stale' : ''}`;
+          const arrow = document.createElement('span');
+          arrow.className = 'flight-arrow';
+          arrow.textContent = '▲';
+          arrow.style.transform = `rotate(${Number(flight.heading) || 0}deg)`;
+          element.appendChild(arrow);
+          const markerItem = new maplibregl.Marker({element}).setLngLat([flight.longitude,flight.latitude]);
+          markerItem.setPopup(new maplibregl.Popup({offset:18}).setText(flightDetails(flight)));
+          markerItem.addTo(map);
+          flightMarkers.push(markerItem);
+          flightPoints.set(flight.icao24, [flight.longitude,flight.latitude]);
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'flight-row';
+          const strong = document.createElement('strong');
+          strong.textContent = flight.callsign || 'UNKNOWN CALLSIGN';
+          const small = document.createElement('small');
+          const climb = flight.vertical_rate_mps == null ? 'VERT N/A' : `VERT ${Math.round(flight.vertical_rate_mps * 196.85)} ft/min`;
+          small.textContent = `${flight.icao24} · ${flight.country} · ${flight.altitude_m == null ? 'ALT N/A' : `${Math.round(flight.altitude_m * 3.28084).toLocaleString()} ft`} · ${flight.velocity_mps == null ? 'SPD N/A' : `${Math.round(flight.velocity_mps * 3.6)} km/h`} · ${flight.heading == null ? 'HDG N/A' : `${Math.round(flight.heading)}°`} · ${climb} · SQ ${flight.squawk} · ${flight.distance_km.toFixed(1)} km · ${flight.age_s}s`;
+          row.append(strong, small);
+          row.addEventListener('click', () => {
+            map.flyTo({center:[flight.longitude,flight.latitude],zoom:11.5,duration:650,essential:true});
+            markerItem.togglePopup();
+          });
+          list.appendChild(row);
+        });
+      });
+    }
+  };
+  document.title = 'JARVIS_EARTH_READY';
+</script>
+</body>
+</html>

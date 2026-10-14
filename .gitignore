@@ -1,0 +1,118 @@
+# ==============================================================================
+# JARVIS AI — SECURITY & SENSITIVE DATA EXCLUSIONS (.gitignore)
+# ==============================================================================
+# STRICT POLICY: Under no circumstances should secrets, API keys, passwords,
+# OAuth tokens, private keys, databases, biometric data, or private user
+# histories be committed to version control.
+# ==============================================================================
+
+# 1. API Keys, Tokens, and Credentials
+**/config/api_keys.json
+**/config/api_keys.json.tmp
+**/config/api_keys.json.corrupt-*
+**/config/google_credentials.json
+**/config/google_token.json
+**/config/phone_handoff.json
+**/config/voice_id.dat
+**/config/voice_id.tmp
+**/config/voice_id_model/
+**/config/memory_audit.key
+**/config/memory_audit.anchor
+**/config/memory_encryption.key
+**/config/memory_settings.json
+**/config/whatsapp_web/
+**/config/earth_map_cache/
+**/config/certs/
+
+# Generic Secret Patterns (Keep templates unignored via negation !)
+.env
+.env.*
+!.env.example
+**/*token*.json
+!**/*token*.example.json
+**/*secret*.json
+!**/*secret*.example.json
+**/client_secret*.json
+!**/client_secret*.example.json
+**/*credential*.json
+!**/*credential*.example.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+**/*.cer
+
+# 2. Personal Memories, Databases & Runtime State
+**/memory/long_term.json
+**/memory/long_term.json*
+**/memory/long_term.db
+**/memory/long_term*.db*
+**/memory/*.sqlite3
+**/memory/*.sqlite3.bak
+**/memory/*.rolling-*.bak
+**/memory/backups/
+**/memory/call_state.json
+*.db
+*.sqlite
+*.sqlite3
+
+# 3. Security Audit Logs & Sandboxing
+**/security/audit_log.jsonl
+**/sandbox_runs/
+**/dashboard/uploads/
+**/eval/results/latest.json
+
+# 4. Python Bytecode, Caches & Build Files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 5. Virtual Environments
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+ENV/
+
+# 6. Logs & Runtime Diagnostics
+*.log
+logs/
+**/logs/
+downloads/
+**/downloads/
+screenshots/
+**/screenshots/
+
+# 7. Temporary, Scratch & IDE Files
+scratch_*.png
+**/scratch_*.png
+*.tmp
+*.bak
+*.swp
+*.swo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 8. Large / Personal Media, Holo Camera & Startup Video
+assets/startup_intro.mp4
+**/assets/startup_intro.mp4
+assets/holo/
+**/assets/holo/
+core/startup_video.py
+**/core/startup_video.py
+core/holo_gestures.py
+**/core/holo_gestures.py
+actions/holo_gestures.py
+**/actions/holo_gestures.py
